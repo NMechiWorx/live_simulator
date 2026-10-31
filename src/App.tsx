@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { Grid, OrbitControls } from '@react-three/drei'
 
@@ -25,11 +25,19 @@ import type { HistoryPoint } from './types/history'
 type SafetyEvent = {
   id: number
   employeeId: string
-  zoneId: string
-  zoneName: string
-  type: 'ENTRY' | 'EXIT'
   timestamp: number
-}
+} & (
+  | {
+      type: 'ENTRY'
+      zoneId: string
+      zoneName: string
+      status: 'ACTIVE' | 'ACKNOWLEDGED' | 'RESOLVED'
+    }
+  | { type: 'EXIT'; zoneId: string; zoneName: string }
+  | { type: 'TRACKING_LOSS'; status: 'ACTIVE' | 'ACKNOWLEDGED' | 'RESOLVED' }
+)
+
+const TRACKING_LOSS_THRESHOLD_MS = 5000
 
 type SceneProps = {
   isPlaying: boolean
@@ -301,15 +309,12 @@ function App() {
   // Stage 8: Safety monitoring
   const [events, setEvents] = useState<SafetyEvent[]>([])
 
-  const [acknowledgedIds, setAcknowledgedIds] = useState<
-    number[]
-  >([])
-
   const [zoneOccupancy, setZoneOccupancy] = useState<
     Record<string, string[]>
   >({})
 
   const insideState = useRef<Record<string, boolean>>({})
+  const entryEventIds = useRef<Record<string, number>>({})
   const nextEventId = useRef(0)
 
   // Stage 9: Simulated sensor reporting
@@ -322,10 +327,46 @@ function App() {
   )
 
   const reportThrottle = useRef<Record<string, number>>({})
+  const trackingLossEventIds = useRef<Record<string, number>>({})
+
+  const checkTrackingLoss = useEffectEvent((now: number) => {
+    for (const employee of employees) {
+      const lastReport = lastReports[employee.id]
+      if (lastReport === undefined) continue
+
+      const eventId = trackingLossEventIds.current[employee.id]
+      const isStale = now - lastReport > TRACKING_LOSS_THRESHOLD_MS
+
+      if (isStale && eventId === undefined) {
+        nextEventId.current += 1
+        const event: SafetyEvent = {
+          id: nextEventId.current,
+          employeeId: employee.id,
+          timestamp: now,
+          type: 'TRACKING_LOSS',
+          status: 'ACTIVE',
+        }
+
+        trackingLossEventIds.current[employee.id] = event.id
+        setEvents((previous) => [event, ...previous].slice(0, 200))
+      } else if (!isStale && eventId !== undefined) {
+        delete trackingLossEventIds.current[employee.id]
+        setEvents((previous) =>
+          previous.map((event): SafetyEvent =>
+            event.type === 'TRACKING_LOSS' && event.id === eventId
+              ? { ...event, status: 'RESOLVED' }
+              : event,
+          ),
+        )
+      }
+    }
+  })
 
   useEffect(() => {
     const interval = window.setInterval(() => {
-      setCurrentTime(Date.now())
+      const now = Date.now()
+      setCurrentTime(now)
+      checkTrackingLoss(now)
     }, 1000)
 
     return () => window.clearInterval(interval)
@@ -355,8 +396,8 @@ function App() {
   // Safety alert metrics
   const activeAlerts = events.filter(
     (event) =>
-      event.type === 'ENTRY' &&
-      !acknowledgedIds.includes(event.id),
+      event.type !== 'EXIT' &&
+      event.status === 'ACTIVE',
   )
 
   const occupiedZoneIds = restrictedZones
@@ -471,17 +512,36 @@ function App() {
         // Generate safety event
         nextEventId.current += 1
 
-        const event: SafetyEvent = {
+        const eventDetails = {
           id: nextEventId.current,
           employeeId: id,
           zoneId: zone.id,
           zoneName: zone.name,
-          type: isInside ? 'ENTRY' : 'EXIT',
           timestamp: now,
         }
 
+        const entryEventId = entryEventIds.current[key]
+        const event: SafetyEvent = isInside
+          ? { ...eventDetails, type: 'ENTRY', status: 'ACTIVE' }
+          : { ...eventDetails, type: 'EXIT' }
+
+        if (isInside) {
+          entryEventIds.current[key] = event.id
+        } else {
+          delete entryEventIds.current[key]
+        }
+
         setEvents((previous) =>
-          [event, ...previous].slice(0, 200),
+          [
+            event,
+            ...previous.map((previousEvent): SafetyEvent =>
+              !isInside &&
+              previousEvent.type === 'ENTRY' &&
+              previousEvent.id === entryEventId
+                ? { ...previousEvent, status: 'RESOLVED' }
+                : previousEvent,
+            ),
+          ].slice(0, 200),
         )
       }
     },
@@ -498,17 +558,21 @@ function App() {
   }
 
   const acknowledgeAll = () => {
-    setAcknowledgedIds((previous) => [
-      ...new Set([
-        ...previous,
-        ...activeAlerts.map((event) => event.id),
-      ]),
-    ])
+    const activeIds = new Set(activeAlerts.map((event) => event.id))
+
+    setEvents((previous) =>
+      previous.map((event): SafetyEvent =>
+        event.type !== 'EXIT' &&
+        event.status === 'ACTIVE' &&
+        activeIds.has(event.id)
+          ? { ...event, status: 'ACKNOWLEDGED' }
+          : event,
+      ),
+    )
   }
 
   const clearEventLog = () => {
     setEvents([])
-    setAcknowledgedIds([])
   }
 
   const matchingEmployees = employees.filter((employee) => {
@@ -1028,12 +1092,15 @@ function App() {
                         className="rounded-lg border border-red-500/30 bg-red-950/30 p-3"
                       >
                         <p className="text-sm font-semibold text-red-300">
-                          Restricted Zone Entry
+                          {event.type === 'ENTRY'
+                            ? 'Restricted Zone Entry'
+                            : 'Tracking Loss'}
                         </p>
 
                         <p className="mt-1 text-xs text-slate-300">
-                          {event.employeeId} entered{' '}
-                          {event.zoneName}
+                          {event.type === 'ENTRY'
+                            ? `${event.employeeId} entered ${event.zoneName}`
+                            : `${event.employeeId} stopped reporting`}
                         </p>
 
                         <p className="mt-1 text-xs text-slate-500">
@@ -1065,7 +1132,7 @@ function App() {
               </h2>
 
               <p className="mt-1 text-xs text-slate-400">
-                Employee zone entry and exit records
+                Employee zone entry, exit, and tracking loss records
               </p>
             </div>
 
@@ -1087,6 +1154,7 @@ function App() {
                   <th className="p-3">Employee</th>
                   <th className="p-3">Zone</th>
                   <th className="p-3">Event</th>
+                  <th className="p-3">Status</th>
                 </tr>
               </thead>
 
@@ -1113,21 +1181,41 @@ function App() {
                     </td>
 
                     <td className="p-3">
-                      {event.zoneName}
+                      {event.type === 'TRACKING_LOSS' ? '—' : event.zoneName}
                     </td>
 
                     <td className="p-3">
                       <span
                         className={
-                          event.type === 'ENTRY'
-                            ? 'font-semibold text-red-400'
-                            : 'font-semibold text-green-400'
+                          event.type === 'EXIT'
+                            ? 'font-semibold text-green-400'
+                            : 'font-semibold text-red-400'
                         }
                       >
                         {event.type === 'ENTRY'
                           ? 'RESTRICTED ENTRY'
-                          : 'ZONE EXIT'}
+                          : event.type === 'EXIT'
+                            ? 'ZONE EXIT'
+                            : 'TRACKING LOSS'}
                       </span>
+                    </td>
+
+                    <td className="p-3">
+                      {event.type !== 'EXIT' ? (
+                        <span
+                          className={`font-semibold ${
+                            event.status === 'ACTIVE'
+                              ? 'text-red-400'
+                              : event.status === 'ACKNOWLEDGED'
+                                ? 'text-amber-400'
+                                : 'text-green-400'
+                          }`}
+                        >
+                          {event.status}
+                        </span>
+                      ) : (
+                        <span className="text-slate-500">—</span>
+                      )}
                     </td>
                   </tr>
                 ))}
